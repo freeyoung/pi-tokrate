@@ -1,0 +1,47 @@
+{
+  "name": "pi-tokrate",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Self-calibrating token throughput for Pi: honest tok/s even when the server batches tokens per chunk, plus where the turn actually went",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "Eric Qian",
+  "homepage": "https://github.com/freeyoung/pi-tokrate#readme",
+  "bugs": "https://github.com/freeyoung/pi-tokrate/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freeyoung/pi-tokrate.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tokens",
+    "throughput",
+    "tps",
+    "reasoning",
+    "statusline"
+  ],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.7"
+  }
+}
