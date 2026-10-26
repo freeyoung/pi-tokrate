@@ -125,6 +125,8 @@ The failure mode is worse than an offset. The error equals the accept length, so
 
 The factor is an exponential moving average, stored per `provider/model`, so it survives restarts. The first real sample is adopted outright rather than averaged against the placeholder, so a model is usually calibrated after one turn.
 
+The key is the model that produced the response, not the one you selected. With a [virtual model](https://pi.dev/docs/latest/virtual-models), Pi routes each request to a physical model and names that model on the response. Each physical model gets its own correction, its own baseline and its own output budget. A turn that two models shared still teaches each one from its own responses, but its overall rate belongs to neither, so it gets no colour and does not move a baseline.
+
 **A good base estimator still matters.** Calibration is a single scalar: it moves the centre of the error but cannot narrow its spread. An estimator that reads 96% on code and 176% on Chinese stays wrong through every change of subject, however well calibrated. So the weights were fitted against real output — ratios of estimate to the server's own count:
 
 | content | one per chunk | `/\w+\|[^\s\w]/` | this |

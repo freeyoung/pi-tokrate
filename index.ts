@@ -1,13 +1,15 @@
 import type {
   AgentEndEvent,
+  AgentStartEvent,
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  MessageEndEvent,
   MessageStartEvent,
   MessageUpdateEvent,
 } from "@earendil-works/pi-coding-agent";
 
-import { classify, observe, type Baseline, type Deviation } from "./src/baseline.ts";
+import { classify, observe, type Deviation } from "./src/baseline.ts";
 import { correct, fold, modelKey, type Calibration } from "./src/calibrate.ts";
 import { Meter } from "./src/meter.ts";
 import { renderStatus, type Snapshot } from "./src/render.ts";
@@ -23,24 +25,40 @@ import { read, write, type TokrateSettings } from "./src/store.ts";
 
 const STATUS_KEY = "tokrate";
 
+/** One model's share of a turn: the two sides of its calibration ratio. */
+interface Sample {
+  estimated: number;
+  actual: number;
+}
+
+/** A model's output ceiling, or null when it does not declare one. */
+const budgetOf = (model: ExtensionContext["model"]): number | null =>
+  model?.maxTokens && model.maxTokens > 0 ? model.maxTokens : null;
+
 export default async (pi: ExtensionAPI) => {
   const meter = new Meter();
   let settings: TokrateSettings = read();
-  // Captured when a turn starts: the calibration that turn is being scored
-  // against, and the model it belongs to. Reading them again at the end
-  // would attribute the turn to whatever model is current by then, which is
-  // not necessarily the one that generated it.
-  let turnKey = "";
+  // The calibration the live number is corrected by. It follows the model
+  // that is answering right now, which is not always the one selected: a
+  // virtual model routes each request to a physical one, and a correction
+  // learned on one of them says nothing about another.
   let turnCalibration: Calibration | undefined;
-  let turnBaseline: Baseline | undefined;
   // Set once a turn has finished and been compared against its baseline.
   let turnDeviation: Deviation | null = null;
   let turnThinking: number | null = null;
   let turnAnswer: number | null = null;
-  // The model's output ceiling, captured with the rest of the turn's
-  // context so a mid-session model switch cannot judge one model's
-  // thinking against another's budget.
+  // The answering model's output ceiling, taken from the same place as its
+  // calibration so that one model's thinking is never judged against
+  // another's budget.
   let turnBudget: number | null = null;
+  // What each physical model produced this turn: the estimator's total over
+  // its responses and the provider's count for the same responses. Learning
+  // is filed under the model named on the response, never under ctx.model,
+  // which by the end of the turn may be another model or a virtual one.
+  let served = new Map<string, Sample>();
+  // Where the estimate stood when the current response began, so the share
+  // of it that belongs to this response can be taken at its end.
+  let responseStart = 0;
 
   const snapshot = (): Snapshot => {
     const streaming = meter.isStreaming;
@@ -164,24 +182,55 @@ export default async (pi: ExtensionAPI) => {
     }, settings.display, ctx.ui.theme));
   });
 
-  pi.on("message_start", (event: MessageStartEvent, ctx: ExtensionContext) => {
-    if (event.message.role !== "user") return;
-    // A steering message sent mid-turn is still a user message. Resetting on
-    // it would restart the estimate half way through while agent_end still
-    // reports usage for the whole turn, and calibration would learn that
-    // ratio as if it were real.
-    if (meter.isStreaming) return;
-
-    // The clock starts when the user sends, so time-to-first-token covers
-    // the wait they actually experience.
+  pi.on("agent_start", (_event: AgentStartEvent, ctx: ExtensionContext) => {
+    // Every run opens a turn, not only the ones a user message starts. Pi
+    // also starts a run to retry a failed request, to recover from a context
+    // overflow, to deliver queued messages, and for an extension message
+    // sent with triggerTurn. A meter carried over from the run before would
+    // score each of those against tokens and time it never produced.
+    //
+    // A steering message, by contrast, joins the run already going and
+    // opens nothing, so the estimate keeps covering what agent_end counts.
+    //
+    // agent_start lands just before the user's message is added, so
+    // time-to-first-token still covers the wait they actually experience.
     meter.reset();
+    served = new Map();
+    responseStart = 0;
     turnDeviation = null;
     turnThinking = null;
     turnAnswer = null;
-    turnBudget = ctx.model?.maxTokens && ctx.model.maxTokens > 0 ? ctx.model.maxTokens : null;
-    turnKey = modelKey(ctx.model?.provider, ctx.model?.id);
-    turnCalibration = settings.calibration[turnKey];
-    turnBaseline = settings.baseline[turnKey];
+    // The selected model, until a response names the one actually answering.
+    turnCalibration = settings.calibration[modelKey(ctx.model?.provider, ctx.model?.id)];
+    turnBudget = budgetOf(ctx.model);
+  });
+
+  pi.on("message_start", (event: MessageStartEvent, ctx: ExtensionContext) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    // A response names the physical model that produced it. Under a virtual
+    // model this is the first point at which that is known, and it can
+    // change from one response to the next within a single turn.
+    responseStart = meter.estimatedTokens;
+    turnCalibration = settings.calibration[modelKey(message.provider, message.model)];
+    const answering = ctx.modelRegistry.find(message.provider, message.model);
+    if (answering) turnBudget = budgetOf(answering);
+  });
+
+  pi.on("message_end", (event: MessageEndEvent) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    // A response with no count from the provider has one side of the ratio
+    // and not the other: an aborted request, or a server that sends no
+    // usage. Folding in its estimate alone would teach the ratio that the
+    // estimator overcounts when it did not.
+    if (!(message.usage.output > 0)) return;
+
+    const key = modelKey(message.provider, message.model);
+    const sample = served.get(key) ?? { estimated: 0, actual: 0 };
+    sample.estimated += meter.estimatedTokens - responseStart;
+    sample.actual += message.usage.output;
+    served.set(key, sample);
   });
 
   pi.on("message_update", (event: MessageUpdateEvent, ctx: ExtensionContext) => {
@@ -223,7 +272,6 @@ export default async (pi: ExtensionAPI) => {
       (sum, m) => (m.role === "assistant" ? sum + (m.usage.reasoning ?? 0) : sum),
       0,
     );
-    const estimated = meter.estimatedTokens;
     meter.finish(actual);
 
     if (actual > 0) {
@@ -237,50 +285,41 @@ export default async (pi: ExtensionAPI) => {
       turnAnswer = actual - turnThinking;
     }
 
-    // The whole design in one line: the turn just told us what it really
-    // produced, so score our guess against it and keep the correction.
-    //
-    // Skipped when no turn was ever opened — a run that began without a user
-    // message has no model attributed to it, and filing its ratio under a
-    // blank key would pollute whichever model is loaded next.
-    if (turnKey) {
-      const rate = meter.turnRate();
+    // The whole design in one line: each response just told us what it
+    // really produced, so score our guess against it and keep the correction.
+    let calibration = settings.calibration;
+    for (const [key, sample] of served) {
+      const before = calibration[key];
+      const after = fold(before, sample.estimated, sample.actual);
+      // fold hands back the very same object when a sample carries no
+      // signal, so identity catches that. The samples check catches the
+      // other shape of "nothing learned": a first turn that was rejected
+      // comes back as the placeholder, which is not worth a file write or a
+      // stored entry claiming a model is calibrated.
+      if (after !== before && after.samples > 0) calibration = { ...calibration, [key]: after };
+    }
 
+    // A speed only compares with one model's history. A turn that two
+    // physical models shared has a rate that belongs to neither of them, so
+    // it is neither coloured nor learned from.
+    let baseline = settings.baseline;
+    const rate = meter.turnRate();
+    if (served.size === 1 && rate !== null && meter.actualTokens !== null) {
+      const [key] = served.keys();
+      const before = baseline[key];
       // Classified against the baseline as it stood before this turn. Fold
       // first and the turn would partly explain itself away, pulling the
       // reference towards whatever it was about to be compared with.
-      if (rate !== null && meter.actualTokens !== null) {
-        turnDeviation = classify(rate, turnBaseline);
-      }
+      turnDeviation = classify(rate, before);
+      // observe, like fold, hands back what it was given when it learned
+      // nothing.
+      const after = observe(before, rate, meter.activeSeconds);
+      if (after !== undefined && after !== before) baseline = { ...baseline, [key]: after };
+    }
 
-      const calibration = fold(turnCalibration, estimated, actual);
-      const baseline =
-        rate !== null && meter.actualTokens !== null
-          ? observe(turnBaseline, rate, meter.activeSeconds)
-          : turnBaseline;
-
-      // fold hands back the very same object when a sample carries no
-      // signal, and observe does the same, so identity catches both. The
-      // samples check catches the other shape of "nothing learned": a first
-      // turn that was rejected comes back as the placeholder, which is not
-      // worth a file write or a stored entry claiming a model is calibrated.
-      const learnedRatio = calibration !== turnCalibration && calibration.samples > 0;
-      const learnedRate = baseline !== undefined && baseline !== turnBaseline;
-
-      if (learnedRatio || learnedRate) {
-        settings = {
-          ...settings,
-          calibration: learnedRatio
-            ? { ...settings.calibration, [turnKey]: calibration }
-            : settings.calibration,
-          baseline: learnedRate
-            ? { ...settings.baseline, [turnKey]: baseline }
-            : settings.baseline,
-        };
-        write(settings);
-        if (learnedRatio) turnCalibration = calibration;
-        if (learnedRate) turnBaseline = baseline;
-      }
+    if (calibration !== settings.calibration || baseline !== settings.baseline) {
+      settings = { ...settings, calibration, baseline };
+      write(settings);
     }
 
     paint(ctx, true);
