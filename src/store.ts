@@ -29,7 +29,25 @@ export interface TokrateSettings {
   baseline: Record<string, Baseline>;
 }
 
-const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
+/**
+ * Pi's config directory, resolved the way Pi resolves it.
+ *
+ * PI_CODING_AGENT_DIR moves every file Pi owns. Ignoring it would leave this
+ * key in a settings.json that Pi no longer reads, in a directory the user
+ * believes they moved away from.
+ *
+ * Copied rather than imported: Pi's own getAgentDir() would be the only
+ * runtime import from Pi, where every other one is a type.
+ */
+function agentDir(): string {
+  const dir = process.env.PI_CODING_AGENT_DIR;
+  if (!dir) return path.join(os.homedir(), ".pi", "agent");
+  if (dir === "~") return os.homedir();
+  if (dir.startsWith("~/")) return path.join(os.homedir(), dir.slice(2));
+  return dir;
+}
+
+const SETTINGS_FILE = path.join(agentDir(), "settings.json");
 const SETTINGS_KEY = "tokrate";
 
 const empty = (): TokrateSettings => ({
