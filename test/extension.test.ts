@@ -11,6 +11,7 @@ import * as path from "node:path";
 
 let home: string;
 let originalHome: string | undefined;
+let originalAgentDir: string | undefined;
 
 beforeEach(() => {
   // Deltas in a real stream are milliseconds apart, and both the paint
@@ -18,6 +19,10 @@ beforeEach(() => {
   // inside one millisecond would measure nothing and repaint once.
   vi.useFakeTimers();
   originalHome = process.env.HOME;
+  // Set in the shell running the tests, it would send every write below
+  // into the user's real Pi directory.
+  originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  delete process.env.PI_CODING_AGENT_DIR;
   home = fs.mkdtempSync(path.join(os.tmpdir(), "tokrate-ext-"));
   fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
   process.env.HOME = home;
@@ -28,13 +33,24 @@ afterEach(() => {
   vi.useRealTimers();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   fs.rmSync(home, { recursive: true, force: true });
 });
 
 type Handler = (event: any, ctx: any) => void;
+type Model = { provider: string; id: string; maxTokens?: number };
 
-/** Enough of Pi to run the extension against, plus a window on what it drew. */
-async function boot(model = { provider: "local", id: "m", maxTokens: 65536 }) {
+/**
+ * Enough of Pi to run the extension against, plus a window on what it drew.
+ *
+ * `model` is what the user selected; `catalog` is every model a response can
+ * come from. They differ under a virtual model, which routes each request to
+ * a physical model and names that one on the response.
+ */
+async function boot(
+  model: Model = { provider: "local", id: "m", maxTokens: 65536 },
+  catalog: Model[] = [model],
+) {
   const handlers = new Map<string, Handler>();
   const pi = {
     registerCommand: () => {},
@@ -43,6 +59,10 @@ async function boot(model = { provider: "local", id: "m", maxTokens: 65536 }) {
   const status: string[] = [];
   const ctx = {
     model,
+    modelRegistry: {
+      find: (provider: string, id: string) =>
+        catalog.find((m) => m.provider === provider && m.id === id),
+    },
     ui: {
       setStatus: (_key: string, text: string) => status.push(text),
       notify: () => {},
@@ -60,16 +80,42 @@ async function boot(model = { provider: "local", id: "m", maxTokens: 65536 }) {
     fire("message_update", { assistantMessageEvent: { type, delta: text } });
   };
 
+  // The run's messages, handed back on agent_end as Pi does.
+  let messages: unknown[] = [];
+  /** A response begins, from the physical model that is answering. */
+  const respond = (by: Model = catalog[0]) => {
+    fire("message_start", { message: { role: "assistant", provider: by.provider, model: by.id } });
+    fire("message_update", { assistantMessageEvent: { type: "text_start" } });
+  };
+  /** That response ends, with the provider's count for it. */
+  const reply = (output: number, reasoning?: number, by: Model = catalog[0]) => {
+    const message = { role: "assistant", provider: by.provider, model: by.id, usage: { output, reasoning } };
+    messages.push(message);
+    fire("message_end", { message });
+  };
+  /** A run begins without a user message: a retry, or an extension's triggerTurn. */
+  const startRun = () => {
+    messages = [];
+    fire("agent_start");
+  };
+
   return {
     fire,
     delta,
-    startTurn: () => {
+    respond,
+    reply,
+    startRun,
+    startTurn: (by?: Model) => {
       fire("session_start");
+      startRun();
       fire("message_start", { message: { role: "user" } });
-      fire("message_update", { assistantMessageEvent: { type: "text_start" } });
+      respond(by);
     },
-    endTurn: (output: number, reasoning?: number) =>
-      fire("agent_end", { messages: [{ role: "assistant", usage: { output, reasoning } }] }),
+    endRun: () => fire("agent_end", { messages }),
+    endTurn: (output: number, reasoning?: number, by?: Model) => {
+      reply(output, reasoning, by);
+      fire("agent_end", { messages });
+    },
     latest: () => status[status.length - 1] ?? "",
     /** What reached disk, or an empty shape when nothing was worth writing. */
     settings: () => {
@@ -152,9 +198,7 @@ describe("the extension end to end", () => {
   // the estimator inferred from the stream.
   it("prefers the provider's own reasoning count", async () => {
     const app = await boot();
-    app.fire("session_start");
-    app.fire("message_start", { message: { role: "user" } });
-    app.fire("message_update", { assistantMessageEvent: { type: "text_start" } });
+    app.startTurn();
     for (let i = 0; i < 50; i++) app.delta("text_delta", WORDS(1));
     for (let i = 0; i < 50; i++) app.delta("thinking_delta", WORDS(1));
     app.endTurn(1000, 900); // provider: 900 of the 1000 were reasoning
@@ -183,6 +227,81 @@ describe("the extension end to end", () => {
 
     // Had the reset landed, only half the turn would have been estimated
     // and the ratio would have come out at twice this.
+    expect(app.settings().calibration["local/m"].ratio).toBeCloseTo(2.7, 1);
+  });
+
+  // A virtual model is what the user selects; the response names the
+  // physical model that answered. Only the second one has a tokenizer and a
+  // speed, so only it can own a correction or a baseline.
+  it("files what it learns under the physical model a virtual model routed to", async () => {
+    const big = { provider: "local", id: "big", maxTokens: 65536 };
+    const app = await boot({ provider: "router", id: "auto" }, [big]);
+    app.startTurn(big);
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.endTurn(270, undefined, big);
+
+    expect(Object.keys(app.settings().calibration)).toEqual(["local/big"]);
+    expect(Object.keys(app.settings().baseline)).toEqual(["local/big"]);
+  });
+
+  it("scores each model on its own responses when a turn is shared", async () => {
+    const big = { provider: "local", id: "big" };
+    const small = { provider: "local", id: "small" };
+    const app = await boot({ provider: "router", id: "auto" }, [big, small]);
+    app.startTurn(big);
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.reply(270, undefined, big);
+    app.respond(small);
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.endTurn(100, undefined, small);
+
+    const { calibration, baseline } = app.settings();
+    expect(calibration["local/big"].ratio).toBeCloseTo(2.7, 1);
+    expect(calibration["local/small"].ratio).toBeCloseTo(1.0, 1);
+    // One rate over two models' work belongs to neither.
+    expect(baseline).toEqual({});
+  });
+
+  it("judges thinking against the budget of the model answering", async () => {
+    // The virtual model declares no ceiling; the one it routes to does.
+    const small = { provider: "local", id: "small", maxTokens: 8192 };
+    const app = await boot({ provider: "router", id: "auto" }, [small]);
+    app.startTurn(small);
+    for (let i = 0; i < 50; i++) app.delta("thinking_delta", WORDS(100));
+    expect(app.latest()).toContain("<warning>");
+  });
+
+  // An aborted request streams text and reports no count. Its estimate
+  // alone would read as the estimator overcounting.
+  it("leaves out a response the provider never counted", async () => {
+    const app = await boot();
+    app.startTurn();
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.reply(0);
+    app.respond();
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.endTurn(270);
+
+    expect(app.settings().calibration["local/m"].ratio).toBeCloseTo(2.7, 1);
+  });
+
+  // A retry, or a message an extension sends with triggerTurn, starts a run
+  // with no user message. Carried over, the previous run's time would be
+  // divided into this run's tokens.
+  it("measures a run that no user message started on its own", async () => {
+    const app = await boot();
+    app.startTurn();
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.endTurn(270);
+    const first = app.settings().baseline["local/m"].rate;
+
+    app.startRun();
+    app.respond();
+    for (let i = 0; i < 100; i++) app.delta("text_delta", WORDS(1));
+    app.endTurn(270);
+
+    // The same work at the same pace: the baseline should not move.
+    expect(app.settings().baseline["local/m"].rate).toBeCloseTo(first, 0);
     expect(app.settings().calibration["local/m"].ratio).toBeCloseTo(2.7, 1);
   });
 
