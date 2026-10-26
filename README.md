@@ -174,7 +174,7 @@ Two rules keep it honest: the baseline moves slower than the signal it is a refe
 
 ## Storage
 
-Under the `tokrate` key in `~/.pi/agent/settings.json`:
+Under the `tokrate` key in `~/.pi/agent/settings.json`, or in the directory that `PI_CODING_AGENT_DIR` names when you set it:
 
 ```json
 {

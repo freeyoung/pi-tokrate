@@ -10,9 +10,14 @@ import * as path from "node:path";
 let home: string;
 let settingsPath: string;
 let originalHome: string | undefined;
+let originalAgentDir: string | undefined;
 
 beforeEach(() => {
   originalHome = process.env.HOME;
+  // Pi's own override wins over the home directory. Left set from the shell
+  // running the tests, it would point every write here at the real thing.
+  originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  delete process.env.PI_CODING_AGENT_DIR;
   home = fs.mkdtempSync(path.join(os.tmpdir(), "tokrate-"));
   fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
   settingsPath = path.join(home, ".pi", "agent", "settings.json");
@@ -23,6 +28,8 @@ beforeEach(() => {
 afterEach(() => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -133,5 +140,30 @@ describe("write", () => {
     write({ display: DEFAULTS, calibration: { m: { ratio: 1.5, samples: 1 } }, baseline: {} });
     expect(onDisk().tokrate.calibration.m).toEqual({ ratio: 1.5, samples: 1 });
     expect(onDisk().somethingElse).toBe(true);
+  });
+});
+
+describe("location", () => {
+  // Pi keeps its settings wherever PI_CODING_AGENT_DIR says. Writing to the
+  // default path regardless would put this key in a file Pi never reads.
+  it("follows Pi's config directory when it has been moved", async () => {
+    const moved = path.join(home, "elsewhere");
+    fs.mkdirSync(moved);
+    process.env.PI_CODING_AGENT_DIR = moved;
+    const { write } = await load();
+    write({ display: DEFAULTS, calibration: { "a/b": { ratio: 1.2, samples: 3 } }, baseline: {} });
+
+    const written = JSON.parse(fs.readFileSync(path.join(moved, "settings.json"), "utf8"));
+    expect(written.tokrate.calibration["a/b"].ratio).toBe(1.2);
+    expect(fs.existsSync(settingsPath)).toBe(false);
+  });
+
+  it("expands a leading tilde the way Pi does", async () => {
+    fs.mkdirSync(path.join(home, "pi-config"));
+    process.env.PI_CODING_AGENT_DIR = "~/pi-config";
+    const { write } = await load();
+    write({ display: DEFAULTS, calibration: {}, baseline: {} });
+
+    expect(fs.existsSync(path.join(home, "pi-config", "settings.json"))).toBe(true);
   });
 });
